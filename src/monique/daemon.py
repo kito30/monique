@@ -13,7 +13,7 @@ from pathlib import Path
 from .hyprland import HyprlandIPC
 from .niri import NiriIPC
 from .sway import SwayIPC
-from .models import Profile, apply_clamshell, undo_clamshell
+from .models import MonitorConfig, Profile, apply_clamshell, undo_clamshell
 from .profile_manager import ProfileManager
 from .utils import load_app_settings
 
@@ -223,6 +223,27 @@ class MonitorDaemon:
 
             settings = load_app_settings()
             clamshell = settings.get("clamshell_mode", False)
+
+            # Clamshell: if lid is closed with no external monitors, force-enable internal
+            if clamshell and self._lid_closed:
+                has_external = any(not m.is_internal for m in monitors)
+                if not has_external:
+                    is_internal_disabled = any(m.is_internal and not m.enabled for m in monitors)
+                    if is_internal_disabled:
+                        log.info(
+                            "Clamshell: no external monitors and lid closed, "
+                            "force-enabling internal display(s)"
+                        )
+                        monitors_copy = [MonitorConfig.from_dict(m.to_dict()) for m in monitors]
+                        if undo_clamshell(monitors_copy):
+                            temp = Profile(name="clamshell-hot-unplug", monitors=monitors_copy)
+                            update_sddm = settings.get("update_sddm", True)
+                            use_desc = not settings.get("use_port_names", False)
+                            ipc.apply_profile(
+                                temp, update_sddm=update_sddm, use_description=use_desc
+                            )
+                            self._last_apply_time = time.monotonic()
+                        return  # State is corrected, skip further processing
 
             profile = self._profile_mgr.find_best_match(fingerprint, monitors)
             if profile:
