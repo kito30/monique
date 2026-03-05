@@ -35,6 +35,7 @@ package() {
     cd "$startdir"
     python -m installer --destdir="$pkgdir" dist/*.whl
 
+
     # Desktop entry
     install -Dm644 data/com.github.monique.desktop \
         "$pkgdir/usr/share/applications/com.github.monique.desktop"

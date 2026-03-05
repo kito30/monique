@@ -252,12 +252,10 @@ class MonitorDaemon:
                     profile = Profile.from_dict(profile.to_dict())
                     undo_clamshell(profile.monitors)
                     if self._lid_closed is not False:
-                        connected_externals = [
-                            m for m in profile.monitors
-                            if not m.is_internal and m.enabled
-                            and m.description in connected_descs
-                        ]
-                        if connected_externals:
+                        has_external_connected = any(
+                            not m.is_internal and m.enabled for m in monitors
+                        )
+                        if has_external_connected:
                             apply_clamshell(profile.monitors)
                             log.info("Clamshell: lid closed, disabled internal display(s)")
                         else:
