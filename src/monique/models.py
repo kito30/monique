@@ -112,6 +112,17 @@ class MonitorConfig:
     sdr_brightness: float = 1.0
     sdr_saturation: float = 1.0
 
+    # HDR / EDID Override (Hyprland monitorv2 only)
+    hdr: bool = False
+    sdr_eotf: int = 0              # 0=global, 1=sRGB, 2=Gamma 2.2
+    supports_hdr: int = 0          # 0=auto, 1=force on
+    supports_wide_color: int = 0   # 0=auto, 1=force on
+    sdr_min_luminance: float = 0.0
+    sdr_max_luminance: float = 0.0
+    min_luminance: float = 0.0
+    max_luminance: float = 0.0
+    max_avg_luminance: float = 0.0
+
     # Reserved area
     reserved_top: int = 0
     reserved_bottom: int = 0
@@ -175,10 +186,28 @@ class MonitorConfig:
         7: ("right", "x"),
     }
 
-    # Mapping from Transform enum (CCW, Wayland protocol) to Sway config
-    # Sway transform strings match WL_OUTPUT_TRANSFORM enum values:
-    # both Hyprland and Sway use the same Wayland protocol convention.
+    # Mapping from Transform enum (CCW, Wayland protocol) to Sway config.
+    # Sway rotates CLOCKWISE while the Wayland protocol / Hyprland use CCW,
+    # so 90° CCW (enum 1) becomes Sway "270" (270° CW) and vice-versa.
     _SWAY_TRANSFORMS: ClassVar[dict[int, str]] = {
+        0: "normal",
+        1: "270",
+        2: "180",
+        3: "90",
+        4: "flipped",
+        5: "flipped-270",
+        6: "flipped-180",
+        7: "flipped-90",
+    }
+
+    # Inverse mapping: Sway transform string -> Transform enum value
+    _SWAY_TRANSFORMS_INV: ClassVar[dict[str, int]] = {
+        v: k for k, v in _SWAY_TRANSFORMS.items()
+    }
+
+    # Mapping from Transform enum (CCW) to Niri config strings.
+    # Niri follows the Wayland protocol CCW convention, so values map 1:1.
+    _NIRI_TRANSFORMS: ClassVar[dict[int, str]] = {
         0: "normal",
         1: "90",
         2: "180",
@@ -187,11 +216,6 @@ class MonitorConfig:
         5: "flipped-90",
         6: "flipped-180",
         7: "flipped-270",
-    }
-
-    # Inverse mapping: Sway transform string -> Transform enum value
-    _SWAY_TRANSFORMS_INV: ClassVar[dict[str, int]] = {
-        v: k for k, v in _SWAY_TRANSFORMS.items()
     }
 
     # Mapping from Niri JSON transform string -> Transform enum value
@@ -247,12 +271,19 @@ class MonitorConfig:
         if use_description and self.description:
             if niri_ids and self.description in niri_ids:
                 identifier = f'"{niri_ids[self.description]}"'
-            elif niri_ids is None:
-                # No mapping available, best-effort with normalised description
-                identifier = f'"{self.description}"'
+            elif niri_ids is None and self.make:
+                # No Niri IPC available (cross-write from another compositor).
+                # Reconstruct the Niri-native description from make/model/serial.
+                # Match primarily by serial; fall back to model if unavailable.
+                make = self.make
+                if len(make) == 3 and make.isalpha() and make.isupper():
+                    make = f"PNP({make})"
+                serial = self.serial if self.serial and self.serial != "Unknown" else ""
+                parts = [p for p in (make, self.model, serial) if p]
+                identifier = f'"{" ".join(parts)}"'
             else:
-                # Mapping available but monitor not in it (e.g. off monitor
-                # not currently visible to Niri); fall back to port name
+                # Mapping available but monitor not in it, or no make info;
+                # fall back to connector name
                 identifier = f'"{self.name}"'
         else:
             identifier = f'"{self.name}"'
@@ -269,8 +300,8 @@ class MonitorConfig:
         if self.scale_mode == ScaleMode.EXPLICIT:
             lines.append(f"    scale {self.scale:g}")
 
-        # Transform (same values as Sway)
-        transform_str = self._SWAY_TRANSFORMS[self.transform.value]
+        # Transform (Niri uses CCW like Wayland protocol, different from Sway CW)
+        transform_str = self._NIRI_TRANSFORMS[self.transform.value]
         if transform_str != "normal":
             lines.append(f'    transform "{transform_str}"')
 
@@ -300,7 +331,7 @@ class MonitorConfig:
         # Resolution
         if self.resolution_mode == ResolutionMode.EXPLICIT:
             parts.append(f"--mode {self.width}x{self.height}")
-            parts.append(f"--rate {self.refresh_rate:.2f}")
+            parts.append(f"--rate {self.refresh_rate:.3f}")
         else:
             parts.append("--auto")
 
@@ -394,6 +425,102 @@ class MonitorConfig:
 
         return line
 
+    def to_hyprland_v2_block(
+        self,
+        use_description: bool = False,
+        name_to_id: dict[str, str] | None = None,
+    ) -> str:
+        """Generate a ``monitorv2 { … }`` config block for Hyprland >= 0.50."""
+        lines: list[str] = []
+
+        # Output identifier (must be first attribute)
+        if use_description and self.description:
+            lines.append(f"  output = desc:{self.description}")
+        else:
+            lines.append(f"  output = {self.name}")
+
+        # Disabled monitor
+        if not self.enabled:
+            lines.append("  disabled = 1")
+            return "monitorv2 {\n" + "\n".join(lines) + "\n}"
+
+        # Mode (resolution@refresh)
+        if self.resolution_mode == ResolutionMode.EXPLICIT:
+            refresh = f"{self.refresh_rate:g}"
+            lines.append(f"  mode = {self.width}x{self.height}@{refresh}")
+        else:
+            lines.append(f"  mode = {self.resolution_mode.value}")
+
+        # Position
+        if self.position_mode == PositionMode.EXPLICIT:
+            lines.append(f"  position = {self.x}x{self.y}")
+        else:
+            lines.append(f"  position = {self.position_mode.value}")
+
+        # Scale
+        if self.scale_mode == ScaleMode.AUTO:
+            lines.append("  scale = auto")
+        else:
+            lines.append(f"  scale = {self.scale:g}")
+
+        # Transform
+        if self.transform != Transform.NORMAL:
+            lines.append(f"  transform = {self.transform.value}")
+
+        # Mirror
+        if self.mirror_of:
+            mirror_id = self.mirror_of
+            if name_to_id and self.mirror_of in name_to_id:
+                mirror_id = name_to_id[self.mirror_of]
+            lines.append(f"  mirror = {mirror_id}")
+
+        # Bitdepth
+        if self.bitdepth != 8:
+            lines.append(f"  bitdepth = {self.bitdepth}")
+
+        # VRR
+        if self.vrr != VRR.OFF:
+            lines.append(f"  vrr = {self.vrr.value}")
+
+        # Color management (hdr bool falls back to cm = hdr if no explicit cm set)
+        cm = self.color_management or ("hdr" if self.hdr else "")
+        if cm:
+            lines.append(f"  cm = {cm}")
+
+        # SDR brightness / saturation
+        if self.sdr_brightness != 1.0:
+            lines.append(f"  sdrbrightness = {self.sdr_brightness:g}")
+        if self.sdr_saturation != 1.0:
+            lines.append(f"  sdrsaturation = {self.sdr_saturation:g}")
+
+        # Reserved area (space-separated in v2)
+        if any((self.reserved_top, self.reserved_bottom,
+                self.reserved_left, self.reserved_right)):
+            lines.append(
+                f"  addreserved = {self.reserved_top} {self.reserved_bottom} "
+                f"{self.reserved_left} {self.reserved_right}"
+            )
+
+        # HDR / EDID Override
+        if self.sdr_eotf != 0:
+            lines.append(f"  sdr_eotf = {self.sdr_eotf}")
+        if self.supports_hdr != 0:
+            lines.append(f"  supports_hdr = {self.supports_hdr}")
+        if self.supports_wide_color != 0:
+            lines.append(f"  supports_wide_color = {self.supports_wide_color}")
+        if self.sdr_min_luminance != 0.0:
+            lines.append(f"  sdr_min_luminance = {self.sdr_min_luminance:g}")
+        if self.sdr_max_luminance != 0.0:
+            lines.append(f"  sdr_max_luminance = {self.sdr_max_luminance:g}")
+        if self.min_luminance != 0.0:
+            lines.append(f"  min_luminance = {self.min_luminance:g}")
+        if self.max_luminance != 0.0:
+            lines.append(f"  max_luminance = {self.max_luminance:g}")
+        if self.max_avg_luminance != 0.0:
+            lines.append(f"  max_avg_luminance = {self.max_avg_luminance:g}")
+
+        return "monitorv2 {\n" + "\n".join(lines) + "\n}"
+
     def to_dict(self) -> dict:
         """Serialize to a JSON-friendly dict."""
         d = asdict(self)
@@ -453,7 +580,7 @@ class MonitorConfig:
             serial=data.get("serial", ""),
             width=data.get("width", 1920),
             height=data.get("height", 1080),
-            refresh_rate=round(data.get("refreshRate", 60.0), 2),
+            refresh_rate=round(data.get("refreshRate", 60.0), 3),
             resolution_mode=ResolutionMode.EXPLICIT,
             available_modes=modes,
             x=raw_x,
@@ -481,15 +608,15 @@ class MonitorConfig:
         height = current_mode.get("height", 1080)
         # Sway reports refresh in millihertz
         refresh_mhz = current_mode.get("refresh", 60000)
-        refresh_rate = round(refresh_mhz / 1000.0, 2)
+        refresh_rate = round(refresh_mhz / 1000.0, 3)
 
         # Available modes
         modes: list[str] = []
         for m in data.get("modes", []):
             mw = m.get("width", 0)
             mh = m.get("height", 0)
-            mr = round(m.get("refresh", 0) / 1000.0, 2)
-            modes.append(f"{mw}x{mh}@{mr:.2f}Hz")
+            mr = round(m.get("refresh", 0) / 1000.0, 3)
+            modes.append(f"{mw}x{mh}@{mr:.3f}Hz")
 
         # Position
         rect = data.get("rect", {})
@@ -558,15 +685,15 @@ class MonitorConfig:
         height = current_mode.get("height", 1080)
         # Niri reports refresh in millihertz
         refresh_mhz = current_mode.get("refresh_rate", 60000)
-        refresh_rate = round(refresh_mhz / 1000.0, 2)
+        refresh_rate = round(refresh_mhz / 1000.0, 3)
 
         # Available modes
         available: list[str] = []
         for m in modes_list:
             mw = m.get("width", 0)
             mh = m.get("height", 0)
-            mr = round(m.get("refresh_rate", 0) / 1000.0, 2)
-            available.append(f"{mw}x{mh}@{mr:.2f}Hz")
+            mr = round(m.get("refresh_rate", 0) / 1000.0, 3)
+            available.append(f"{mw}x{mh}@{mr:.3f}Hz")
 
         # Logical info (position, scale, transform) — null if disabled
         logical = data.get("logical")
@@ -727,6 +854,166 @@ class WorkspaceRule:
 
 # ── Profile ──────────────────────────────────────────────────────────────
 
+_XSETUP_TEMPLATE = '''\
+#!/usr/bin/env python3
+"""SDDM Xsetup — Generated by Monique.
+
+Matches monitors by EDID description so the script works regardless of
+whether the X11 driver uses the same output names as the Wayland compositor
+(e.g. NVIDIA uses DFP-* instead of DP-*/HDMI-A-*).
+"""
+import re, subprocess, sys, time
+
+# (edid_description, wayland_name, xrandr_args_with_wayland_name)
+MONITORS = {monitors}
+FB_SIZE = "{fb_size}"
+
+
+def _parse_edid(hex_str):
+    """Extract (monitor_name, serial) from raw EDID hex."""
+    try:
+        data = bytes.fromhex(hex_str)
+    except ValueError:
+        return "", ""
+    name = ""
+    serial = ""
+    for off in (54, 72, 90, 108):
+        if off + 18 > len(data):
+            break
+        tag = data[off + 3]
+        text = data[off + 5 : off + 18].split(b"\\x0a")[0]
+        text = text.decode("ascii", errors="ignore").strip()
+        if tag == 0xFC and not name:
+            name = text
+        elif tag == 0xFF and not serial:
+            serial = text
+    return name, serial
+
+
+def _get_edid_map():
+    """Return {{x11_output: (edid_name, edid_serial)}} for connected outputs."""
+    try:
+        r = subprocess.run(
+            ["xrandr", "--verbose"], capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return {{}}
+    result = {{}}
+    cur = None
+    edid = ""
+    in_edid = False
+    for line in r.stdout.splitlines():
+        m = re.match(r"^(\\S+)\\s+connected", line)
+        if m:
+            if cur and edid:
+                result[cur] = _parse_edid(edid)
+            cur = m.group(1)
+            edid = ""
+            in_edid = False
+            continue
+        if re.match(r"^\\s+EDID:", line):
+            in_edid = True
+            continue
+        if in_edid:
+            s = line.strip()
+            if re.match(r"^[0-9a-f]{{2,}}$", s):
+                edid += s
+            else:
+                in_edid = False
+    if cur and edid:
+        result[cur] = _parse_edid(edid)
+    return result
+
+
+def _resolve(monitors, edid_map):
+    """Return list of xrandr arg strings with correct X11 output names."""
+    connected = set(edid_map)
+    wayland_names = {{name for _, name, _ in monitors}}
+
+    # Fast path: all Wayland names exist in X11 (Intel/AMD)
+    if wayland_names <= connected:
+        return [args for _, _, args in monitors]
+
+    # EDID matching: map profile description -> X11 output
+    avail = dict(edid_map)
+    matched = {{}}  # index -> x11_name
+
+    # Pass 1: match by EDID model name (tag FC)
+    for i, (desc, _, _) in enumerate(monitors):
+        for x11, (ename, _eser) in list(avail.items()):
+            if ename and ename in desc:
+                matched[i] = x11
+                del avail[x11]
+                break
+
+    # Pass 2: match by EDID serial (tag FF)
+    for i, (desc, _, _) in enumerate(monitors):
+        if i in matched:
+            continue
+        for x11, (_ename, eser) in list(avail.items()):
+            if eser and eser in desc:
+                matched[i] = x11
+                del avail[x11]
+                break
+
+    # Pass 3: pair remaining 1:1
+    unmatched = [i for i in range(len(monitors)) if i not in matched]
+    remaining = list(avail)
+    for i, x11 in zip(unmatched, remaining):
+        matched[i] = x11
+
+    # Build final args, replacing output names
+    result = []
+    for i, (_, wl_name, args) in enumerate(monitors):
+        x11 = matched.get(i, wl_name)
+        result.append(args.replace("--output " + wl_name, "--output " + x11, 1))
+    return result
+
+
+def main():
+    lf = open("/tmp/monique-xsetup.log", "w")
+    def _log(msg):
+        lf.write(msg + "\\n")
+        lf.flush()
+
+    _log("Monique Xsetup — " + time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    edid_map = _get_edid_map()
+    _log("EDID map: " + repr(edid_map))
+
+    args = _resolve(MONITORS, edid_map)
+    _log("Resolved args: " + repr(args))
+
+    # Detect used X11 output names
+    used = set()
+    for a in args:
+        m = re.match(r"--output\\s+(\\S+)", a)
+        if m:
+            used.add(m.group(1))
+
+    # Disable connected outputs not in our layout
+    for x11 in sorted(edid_map):
+        if x11 not in used:
+            args.append("--output " + x11 + " --off")
+            _log("Disabling unused output: " + x11)
+
+    cmd = "xrandr --fb " + FB_SIZE + " " + " ".join(args)
+    _log("Command: " + cmd)
+
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    _log("Return code: " + str(r.returncode))
+    if r.stdout.strip():
+        _log("stdout: " + r.stdout.strip())
+    if r.stderr.strip():
+        _log("stderr: " + r.stderr.strip())
+    lf.close()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
 @dataclass
 class Profile:
     name: str = ""
@@ -753,7 +1040,7 @@ class Profile:
             workspace_rules=[WorkspaceRule.from_dict(w) for w in d.get("workspace_rules", [])],
         )
 
-    def generate_config(self, use_description: bool = False) -> str:
+    def generate_config(self, use_description: bool = False, use_v2: bool = False) -> str:
         """Generate the full monitors.conf content for Hyprland."""
         # Build name→identifier mapping for workspace rules and mirror references
         name_to_id: dict[str, str] = {}
@@ -766,10 +1053,17 @@ class Profile:
         lines: list[str] = []
         lines.append("# Generated by Monique — https://github.com/ToRvaLDz/monique")
         lines.append("")
-        for m in self.monitors:
-            lines.append(m.to_hyprland_line(
-                use_description=use_description, name_to_id=name_to_id,
-            ))
+        if use_v2:
+            for m in self.monitors:
+                lines.append(m.to_hyprland_v2_block(
+                    use_description=use_description, name_to_id=name_to_id,
+                ))
+                lines.append("")
+        else:
+            for m in self.monitors:
+                lines.append(m.to_hyprland_line(
+                    use_description=use_description, name_to_id=name_to_id,
+                ))
         if self.workspace_rules:
             lines.append("")
             for w in self.workspace_rules:
@@ -812,29 +1106,35 @@ class Profile:
         return "\n\n".join(blocks) + "\n"
 
     def generate_xsetup_script(self) -> str:
-        """Generate an Xsetup shell script with xrandr commands for SDDM.
+        """Generate an Xsetup Python script with EDID-based output matching.
 
         Compositor positions are in logical (scaled) coordinates, but xrandr
         uses physical pixel positions.  This method converts the layout by
         sorting monitors on each axis and accumulating physical dimensions.
-        All outputs are configured in a single ``xrandr`` invocation so the
-        kernel applies the modeset atomically.
+
+        The generated script matches monitors by EDID description rather than
+        port name, so it works on systems where the X11 driver uses different
+        output names than the Wayland compositor (e.g. NVIDIA DFP-* names).
         """
         phys_pos = self._compute_physical_positions()
 
-        parts = ["xrandr"]
+        monitors_data: list[tuple[str, str, str]] = []
+        fb_w = 0
+        fb_h = 0
         for m in self.monitors:
+            if not m.enabled:
+                continue  # skip disabled monitors; xrandr leaves them at X11 default
             px, py = phys_pos.get(m.name, (m.x, m.y))
-            parts.append("  " + m.to_xrandr_args(phys_x=px, phys_y=py))
+            args = m.to_xrandr_args(phys_x=px, phys_y=py)
+            monitors_data.append((m.description, m.name, args))
+            pw, ph = m.physical_size_rotated
+            fb_w = max(fb_w, px + pw)
+            fb_h = max(fb_h, py + ph)
 
-        cmd = " \\\n".join(parts)
-        lines = [
-            "#!/bin/sh",
-            "# Generated by Monique — https://github.com/ToRvaLDz/monique",
-            cmd,
-            "",
-        ]
-        return "\n".join(lines)
+        return _XSETUP_TEMPLATE.format(
+            monitors=repr(monitors_data),
+            fb_size=f"{fb_w}x{fb_h}",
+        )
 
     def _compute_physical_positions(self) -> dict[str, tuple[int, int]]:
         """Convert logical compositor positions to physical xrandr positions.
